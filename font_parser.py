@@ -1,208 +1,447 @@
-import re
-from PIL import Image
-import os
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+GoldenEye 007 (N64) font extractor → PNG
+
+Goal
+-----
+[0] Read a C source that defines a GoldenEye font as two arrays:
+    - `<name>_fontchartable` : u32 entries describing each glyph (6 u32 per glyph)
+    - `<name>_fontbytes`     : u32-packed raw IA4 image data (tiled 8×8)
+[1] Parse those arrays from the C file.
+[2] Deswizzle/de-tile IA4 nibble data into linear scanline order.
+[3] Decode IA4 (3 bits intensity, 1 bit alpha) → RGBA8.
+[4] Rebuild glyph bitmaps and save:
+    - a single 'A' sample PNG
+    - (optionally) a full atlas PNG packing all glyphs.
+
+Background (formats)
+--------------------
+• IA4 texel = 4 bits total: I(3 bits) + A(1 bit). Intensity is replicated to RGB, alpha is 1-bit.
+  Source: Nintendo 64 Programming Manual (IA4 = 3/1).  # see refs in the chat body.
+• Texture data in GE fonts is stored as 8×8 tiles, packed nibbles (two pixels per byte),
+  in simple row-major tile ordering. We "deswizzle" back to linear.
+
+C Structures (reverse-engineered from decomp)
+---------------------------------------------
+Each glyph descriptor is 6 × u32 (24 bytes):
+    0x00: id           # codepoint (e.g., 65 for 'A')
+    0x04: v_offset     # vertical offset from baseline (pixels; positive moves down)
+    0x08: height       # glyph height in pixels
+    0x0C: width        # glyph width in pixels
+    0x10: flags        # unknown/flags/advance (often unused for decoding)
+    0x14: data_offset  # byte offset to IA4 tiled data (relocated to pointer at runtime)
+
+Notes
+-----
+• We assume the first glyph with a valid `width>0` has the lowest `data_offset`;
+  we treat that as the "base" and address subsequent glyphs relative to it
+  (matching how assets are commonly stored/relocated in engine memory).
+• IA4 intensity expansion uses exact scaling I(0..7) → 0..255 as (I*255)//7
+  (visually smoother than I*32). Alpha uses 0 or 255.
+
+Usage
+-----
+Place this script next to `<font_name>.c` (e.g., `fontBankGothic.c`) and run it.
+"""
+
 import math
+import os
+import re
+from dataclasses import dataclass
+from typing import List, Tuple, Iterable, Optional
 
-# ==========================================================
-# Function 1: Parse C array from a source file
-# ----------------------------------------------------------
-# This function finds and extracts an array definition from
-# the .c font file. It looks for "u32 <array_name>[] = {...};"
-# and converts the hexadecimal values to integers.
-# ==========================================================
-def parse_c_array(c_source, array_name):
-    # Regex to capture array content inside { ... }
+from PIL import Image
+
+
+# [1] ---------- Parsing helpers -------------------------------------------------
+
+def parse_c_array(c_source: str, array_name: str) -> List[int]:
+    """
+    [1.1] Extract a `u32` C array by name and return it as a list of integers.
+
+    Expected C fragment:
+        u32 fontBankGothic_fontchartable[] = {
+            0x00000041, 0x00000004, ...
+        };
+
+    We:
+      • capture content between braces {...}
+      • split by commas
+      • parse each as hex int
+    """
+    # [1.1.a] Regex captures `u32 <arr>[...] = { ... };` with non-greedy body.
     regex = r"u32\s+" + re.escape(array_name) + r"\s*\[[^\]]*\]\s*=\s*\{(.*?)\};"
-    match = re.search(regex, c_source, re.S)
-    if not match: return []
-    content = match.group(1).replace("\n", "").strip()
-    values = [v.strip() for v in content.split(',') if v.strip()]
-    return [int(v, 16) for v in values]
+    m = re.search(regex, c_source, re.S)
+    if not m:
+        return []
+    # [1.1.b] Normalize whitespace, then split into tokens.
+    content = m.group(1).replace("\n", " ").strip()
+    values = [v.strip() for v in content.split(",") if v.strip()]
+    # [1.1.c] Parse tokens as hex (e.g., 0x1234ABCD).
+    out: List[int] = []
+    for v in values:
+        # Accept formats like 0x..., decimal, or macro-like constants if any slipped in.
+        v_clean = v
+        # Drop possible trailing comments.
+        v_clean = v_clean.split("/*")[0].split("//")[0].strip()
+        if not v_clean:
+            continue
+        # Try hex first
+        if v_clean.lower().startswith("0x"):
+            out.append(int(v_clean, 16))
+        else:
+            # Fallback to decimal
+            out.append(int(v_clean, 10))
+    return out
 
 
-# ==========================================================
-# Function 2: Decode IA4 (Intensity + Alpha, 4 bits per pixel)
-# ----------------------------------------------------------
-# Each nibble (4 bits) encodes:
-#   - bits 1..3: intensity (0-7 range, scaled to 0-255)
-#   - bit 0: alpha (1 = visible, 0 = transparent)
-#
-# This is expanded into a standard 32-bit RGBA pixel buffer
-# for Pillow (Python Imaging Library).
-# ==========================================================
-def decode_ia4_to_rgba(data: bytes, width: int, height: int) -> Image:
-    output_pixels = bytearray(width * height * 4)
-    numpixels = width * height
+# [2] ---------- IA4 decoding + tile deswizzle ----------------------------------
 
-    for i in range(numpixels):
-        byte_index = i // 2
-        if byte_index >= len(data):
-            break
-
-        # Extract nibble (4 bits)
-        nibble = (data[byte_index] >> 4) & 0x0F if i % 2 == 0 else data[byte_index] & 0x0F
-
-        # Split nibble into intensity and alpha
-        intensity_3bit = (nibble >> 1) & 0x07   # 3-bit intensity
-        alpha_1bit = nibble & 0x01              # 1-bit alpha
-
-        # Scale to 8-bit
-        intensity_8bit = intensity_3bit * 32
-        alpha_8bit = alpha_1bit * 255
-
-        # Store RGBA
-        pixel_index = i * 4
-        output_pixels[pixel_index:pixel_index+4] = [intensity_8bit, intensity_8bit, intensity_8bit, alpha_8bit]
-
-    return Image.frombytes('RGBA', (width, height), bytes(output_pixels))
+def ia4_nibbles_from_bytes(tiled_data: bytes) -> List[int]:
+    """
+    [2.1] Expand packed bytes to a list of 4-bit values (one per pixel).
+          Byte b = [hi:pixel0 (4b)] [lo:pixel1 (4b)].
+    """
+    nibbles: List[int] = []
+    for b in tiled_data:
+        nibbles.append((b >> 4) & 0xF)
+        nibbles.append(b & 0xF)
+    return nibbles
 
 
-# ==========================================================
-# Function 3: Deswizzle font graphics from N64 tile layout
-# ----------------------------------------------------------
-# Nintendo 64 graphics are stored in 8x8 tiles (swizzled).
-# This function rearranges (deswizzles) them into a normal
-# linear order so they can be decoded properly.
-# ==========================================================
 def deswizzle_simple_tiled(tiled_data: bytes, width: int, height: int) -> bytes:
-    # Step 1: expand bytes into individual 4-bit pixels
-    tiled_pixels = []
-    for byte in tiled_data:
-        tiled_pixels.append((byte >> 4) & 0xF)
-        tiled_pixels.append(byte & 0xF)
+    """
+    [2.2] Convert 8×8-tiled IA4 data → linear row-major bytes (two pixels per byte).
 
-    # Step 2: prepare linear storage
-    linear_pixels = [0] * (width * height)
-    tile_width, tile_height = 8, 8
-    width_in_tiles = math.ceil(width / tile_width)
+    Assumptions:
+      • Tiles are 8×8 pixels.
+      • Tiles are stored row-major across the image (left→right, then top→bottom).
+      • Each pixel is a 4-bit nibble. We repack back to bytes after linearization.
 
-    # Step 3: iterate through every pixel coordinate
+    Returned bytes are packed as: hi-nibble = pixel0, lo-nibble = pixel1.
+    """
+    # [2.2.a] Split to nibbles for easier addressing.
+    tiled_nibbles = ia4_nibbles_from_bytes(tiled_data)
+
+    tile_w, tile_h = 8, 8
+    tiles_per_row = math.ceil(width / tile_w)
+
+    total_pixels = width * height
+    linear_pixels_4b = [0] * total_pixels
+
+    # [2.2.b] For each output pixel (x, y) compute its source (tile-major) index.
     for y in range(height):
         for x in range(width):
-            tile_x, in_tile_x = divmod(x, tile_width)
-            tile_y, in_tile_y = divmod(y, tile_height)
-            
-            tile_index = tile_y * width_in_tiles + tile_x
-            in_tile_offset = in_tile_y * tile_width + in_tile_x
-            
-            swizzled_pixel_offset = tile_index * (tile_width * tile_height) + in_tile_offset
-            linear_pixel_offset = y * width + x
+            tile_x, in_tile_x = divmod(x, tile_w)
+            tile_y, in_tile_y = divmod(y, tile_h)
 
-            if swizzled_pixel_offset < len(tiled_pixels):
-                linear_pixels[linear_pixel_offset] = tiled_pixels[swizzled_pixel_offset]
+            tile_index = tile_y * tiles_per_row + tile_x
+            in_tile_offset = in_tile_y * tile_w + in_tile_x
 
-    # Step 4: pack back into bytes (two pixels per byte)
-    linear_bytes = bytearray()
-    for i in range(0, len(linear_pixels), 2):
-        p1 = linear_pixels[i]
-        p2 = linear_pixels[i+1] if i + 1 < len(linear_pixels) else 0
-        linear_bytes.append((p1 << 4) | p2)
-        
-    return bytes(linear_bytes)
+            src_idx = tile_index * (tile_w * tile_h) + in_tile_offset
+            dst_idx = y * width + x
+
+            if src_idx < len(tiled_nibbles):
+                linear_pixels_4b[dst_idx] = tiled_nibbles[src_idx]
+            else:
+                # [2.2.c] Safety: out-of-range reads clamp to 0 (transparent black).
+                linear_pixels_4b[dst_idx] = 0
+
+    # [2.2.d] Repack 4-bit pixels back to bytes.
+    out = bytearray()
+    for i in range(0, len(linear_pixels_4b), 2):
+        p0 = linear_pixels_4b[i]
+        p1 = linear_pixels_4b[i + 1] if i + 1 < len(linear_pixels_4b) else 0
+        out.append(((p0 & 0xF) << 4) | (p1 & 0xF))
+    return bytes(out)
 
 
-# ==========================================================
-# MAIN SCRIPT
-# ----------------------------------------------------------
-# Purpose: Load GoldenEye 007 N64 font data from .c file,
-# extract character metadata + graphics, decode them, and
-# export as PNG image.
-# ==========================================================
-def main():
-    # Step 1: Define font name + source file
-    font_name = "fontBankGothic"
-    c_file_path = f"{font_name}.c"
-    print(f"Reading C source file: {c_file_path}...")
-    with open(c_file_path, 'r') as f: c_source = f.read()
+def decode_ia4_to_rgba(data: bytes, width: int, height: int) -> Image.Image:
+    """
+    [2.3] Decode IA4 linear bytes → RGBA8 Pillow image.
 
-    # Step 2: Parse font arrays from .c
-    print("Parsing font data arrays...")
-    chartable = parse_c_array(c_source, f"{font_name}_fontchartable")
-    fontbytes_u32 = parse_c_array(c_source, f"{font_name}_fontbytes")
-    font_byte_array = b''.join(val.to_bytes(4, 'big') for val in fontbytes_u32)
+    IA4 nibble layout (per pixel):
+        bits 3..1 = intensity (I: 0..7)
+        bit  0    = alpha     (A: 0 or 1)
 
-    # ======================================================
-    # FONT CHARACTER TABLE STRUCTURE (GoldenEye N64)
-    # Each entry in "fontchartable" is 6 words (u32):
-    #   0x00: character ID (ASCII code)
-    #   0x04: vertical offset (y offset for drawing)
-    #   0x08: height (in pixels)
-    #   0x0C: width  (in pixels)
-    #   0x10: unknown / flags / padding (purpose unclear)
-    #   0x14: data offset (points to fontbytes data)
-    # ======================================================
+    RGB = I expanded to 0..255, A = 0 or 255.
+    We use exact scaling: I8 = (I * 255) // 7
+    """
+    # [2.3.a] Unpack to nibbles first (two pixels per byte).
+    nibbles = ia4_nibbles_from_bytes(data)
+    num_pixels = width * height
+    # [2.3.b] Prepare a flat RGBA buffer.
+    out = bytearray(num_pixels * 4)
 
-    # Step 3: Build list of characters from chartable
-    characters = []
+    for i in range(num_pixels):
+        nib = nibbles[i] if i < len(nibbles) else 0
+        intensity_3 = (nib >> 1) & 0x07
+        alpha_1 = nib & 0x01
+
+        # [2.3.c] Exact 3-bit → 8-bit expansion.
+        i8 = (intensity_3 * 255) // 7
+        a8 = 255 if alpha_1 else 0
+
+        j = i * 4
+        out[j:j + 4] = bytes((i8, i8, i8, a8))
+
+    return Image.frombytes("RGBA", (width, height), bytes(out))
+
+
+# [3] ---------- Glyph model & C-table parsing ----------------------------------
+
+@dataclass
+class Glyph:
+    """[3.1] One glyph entry as defined by the 6×u32 C table (24 bytes)."""
+    codepoint: int      # 0x00
+    v_offset: int       # 0x04
+    height: int         # 0x08
+    width: int          # 0x0C
+    flags: int          # 0x10 (unknown/advance/flags)
+    data_offset: int    # 0x14 (byte offset from base; becomes a pointer at runtime)
+
+
+def parse_glyphs_from_chartable(chartable: List[int]) -> List[Glyph]:
+    """
+    [3.2] Convert raw chartable u32 list → list[Glyph].
+    Each glyph occupies 6 u32 entries: see struct above.
+    """
+    glyphs: List[Glyph] = []
     for i in range(0, len(chartable), 6):
-        entry = chartable[i:i+6]
-        if len(entry) == 6: characters.append({
-            'id': entry[0], 'v_offset': entry[1], 'height': entry[2],
-            'width': entry[3], 'unknown': entry[4], 'data_offset': entry[5]
-        })
-
-    print(f"Found {len(characters)} character definitions.")
-
-    # Step 4: Find base offset (first valid glyph)
-    sorted_chars_by_offset = sorted([c for c in characters if c['width']>0], key=lambda c: c['data_offset'])
-    if not sorted_chars_by_offset: return
-    base_offset = sorted_chars_by_offset[0]['data_offset']
-    print(f"Base offset: {base_offset:#08x}")
-
-    # Step 5: Find specific character "A" (ASCII 65)
-    char_A_info = next((c for c in characters if c['id'] == 65), None)
-    if not char_A_info:
-        print("Character 'A' (ID 65) not found in font data.")
-        return
-
-    # Step 6: Prepare output image (atlas for preview)
-    atlas = Image.new('RGBA', (64, 64), (0, 0, 0, 255))
-    x, y, max_h = 0, 0, 0
-
-    print("Generating single character 'A' PNG...")
-    char = char_A_info
-    w, h = char['width'], char['height']
-    if w == 0 or h == 0: 
-        print("Character 'A' has zero width or height.")
-        return
-
-    # Step 7: Ensure glyph is padded to full 8x8 tiles
-    padded_w = math.ceil(w / 8) * 8
-    padded_h = math.ceil(h / 8) * 8
-    total_tiled_bytes = (padded_w * padded_h) // 2
-
-    # Step 8: Slice out the glyph bitmap from font bytes
-    relative_offset_bytes = char['data_offset'] - base_offset
-    tiled_data = font_byte_array[relative_offset_bytes : relative_offset_bytes + total_tiled_bytes]
-
-    # Step 9: Deswizzle N64 tile layout into linear order
-    linear_data_bytes = deswizzle_simple_tiled(tiled_data, padded_w, padded_h)
-    
-    # Step 10: Debug print of raw pixel values (4-bit hex dump)
-    print("\n--- Raw 4-bit Linear Pixel Data for 'A' (ID 65) ---")
-    linear_pixels_4bit = []
-    for byte in linear_data_bytes:
-        linear_pixels_4bit.append((byte >> 4) & 0xF)
-        linear_pixels_4bit.append(byte & 0xF)
-    
-    for i in range(h):
-        row_str = ''.join([f'{p:X}' for p in linear_pixels_4bit[i*w : (i+1)*w]])
-        print(f"Row {i:2d}: {row_str}")
-    print("--------------------------------------------------")
-
-    # Step 11: Decode IA4 → RGBA image
-    full_glyph_img = decode_ia4_to_rgba(linear_data_bytes, padded_w, padded_h)
-    final_char_img = full_glyph_img.crop((0, 0, w, h))
-
-    # Step 12: Place glyph into atlas
-    atlas.paste(final_char_img, (x, y))
-
-    # Step 13: Save as PNG
-    output_filename = f"{font_name}_A.png"
-    atlas.save(output_filename)
-    print(f"Success! Character 'A' saved to '{output_filename}'")
+        chunk = chartable[i:i + 6]
+        if len(chunk) < 6:
+            continue
+        g = Glyph(
+            codepoint=chunk[0],
+            v_offset=chunk[1],
+            height=chunk[2],
+            width=chunk[3],
+            flags=chunk[4],
+            data_offset=chunk[5],
+        )
+        glyphs.append(g)
+    return glyphs
 
 
-# Entry point
+# [4] ---------- High-level extraction pipeline ---------------------------------
+
+def load_font_arrays_from_c(c_path: str, font_name: str) -> Tuple[List[Glyph], bytes]:
+    """
+    [4.1] Parse the two arrays from `<font_name>.c`:
+          `<font_name>_fontchartable`  (glyph metadata)
+          `<font_name>_fontbytes`      (raw IA4 bytes packed as u32 words)
+
+    Returns:
+        glyphs: parsed list of Glyph entries
+        font_bytes: raw bytes stream (big-endian reassembled from u32 words)
+    """
+    with open(c_path, "r", encoding="utf-8", errors="ignore") as f:
+        c_src = f.read()
+
+    chartable_name = f"{font_name}_fontchartable"
+    fontbytes_name = f"{font_name}_fontbytes"
+
+    # [4.1.a] Parse C arrays.
+    chartable_u32 = parse_c_array(c_src, chartable_name)
+    fontbytes_u32 = parse_c_array(c_src, fontbytes_name)
+
+    if not chartable_u32:
+        raise RuntimeError(f"Array '{chartable_name}' not found or empty in {c_path}")
+    if not fontbytes_u32:
+        raise RuntimeError(f"Array '{fontbytes_name}' not found or empty in {c_path}")
+
+    # [4.1.b] Reassemble raw bytes from big-endian u32 words.
+    font_bytes = b"".join(v.to_bytes(4, "big") for v in fontbytes_u32)
+
+    # [4.1.c] Interpret chartable as Glyphs.
+    glyphs = parse_glyphs_from_chartable(chartable_u32)
+
+    return glyphs, font_bytes
+
+
+def compute_base_offset(glyphs: List[Glyph]) -> int:
+    """
+    [4.2] Determine a "base" data offset.
+         Convention: use the minimum `data_offset` among glyphs with width>0.
+    """
+    valid = [g.data_offset for g in glyphs if g.width > 0 and g.height > 0]
+    if not valid:
+        raise RuntimeError("No valid glyphs with non-zero dimensions found.")
+    return min(valid)
+
+
+def extract_glyph_bitmap(g: Glyph, base_offset: int, font_bytes: bytes) -> Image.Image:
+    """
+    [4.3] Read, deswizzle and decode one glyph image.
+
+    Steps:
+      [4.3.1] Pad width/height up to 8 for tile alignment to compute byte span.
+      [4.3.2] Slice glyph's tiled bytes from the big blob using (g.data_offset - base).
+      [4.3.3] Deswizzle 8×8 tiles → linear IA4 stream.
+      [4.3.4] Decode IA4 → RGBA8.
+      [4.3.5] Crop back to (g.width, g.height) (top-left).
+    """
+    if g.width == 0 or g.height == 0:
+        # [4.3.a] Empty glyph (e.g., space)
+        return Image.new("RGBA", (max(1, g.width), max(1, g.height)), (0, 0, 0, 0))
+
+    padded_w = math.ceil(g.width / 8) * 8
+    padded_h = math.ceil(g.height / 8) * 8
+    tiled_bytes_len = (padded_w * padded_h) // 2  # 2 pixels per byte (IA4)
+
+    rel = g.data_offset - base_offset
+    if rel < 0:
+        raise ValueError(f"Glyph {g.codepoint} has negative relative offset.")
+
+    # [4.3.b] Slice from the font blob; clamp if the source is short.
+    end = min(rel + tiled_bytes_len, len(font_bytes))
+    tiled_slice = font_bytes[rel:end]
+    if len(tiled_slice) < tiled_bytes_len:
+        # Pad with 0 if needed to avoid index errors.
+        tiled_slice = tiled_slice + bytes(tiled_bytes_len - len(tiled_slice))
+
+    # [4.3.c] Deswizzle and decode.
+    linear_ia4 = deswizzle_simple_tiled(tiled_slice, padded_w, padded_h)
+    img_full = decode_ia4_to_rgba(linear_ia4, padded_w, padded_h)
+    # [4.3.d] Crop to the real glyph bounds (origin = top-left).
+    return img_full.crop((0, 0, g.width, g.height))
+
+
+# [5] ---------- Atlas packing (simple row wrap) --------------------------------
+
+def pack_glyphs_into_atlas(glyphs: List[Glyph], images: List[Image.Image],
+                           max_row_width: int = 1024, padding: int = 1) -> Tuple[Image.Image, List[Tuple[int, int]]]:
+    """
+    [5.1] Very simple atlas packer: upload glyphs left→right until row full, then wrap.
+
+    Returns:
+        atlas_image
+        placements: list of (x, y) top-left for each glyph image (same order as `images`)
+    """
+    # [5.1.a] Compute rows.
+    placements: List[Tuple[int, int]] = []
+    x = y = 0
+    row_h = 0
+    used_w = 0
+    max_w = 0
+
+    # First pass to compute atlas bounds.
+    rows: List[List[int]] = [[]]
+    for idx, im in enumerate(images):
+        w, h = im.size
+        if w == 0 or h == 0:
+            w = h = 1  # keep something in atlas for placeholder
+        if x + w > max_row_width and x > 0:
+            # wrap
+            rows.append([])
+            y += row_h + padding
+            x = 0
+            row_h = 0
+        rows[-1].append(idx)
+        placements.append((x, y))
+        x += w + padding
+        row_h = max(row_h, h)
+        used_w = max(used_w, x)
+        max_w = max(max_w, used_w)
+
+    atlas_w = min(max_row_width, max_w)
+    atlas_h = (placements[-1][1] + row_h) if images else 0
+    atlas = Image.new("RGBA", (max(1, atlas_w), max(1, atlas_h)), (0, 0, 0, 0))
+
+    # [5.1.b] Second pass: paste.
+    x = y = 0
+    row_h = 0
+    placements = []
+    for row in rows:
+        x = 0
+        row_h = 0
+        for idx in row:
+            im = images[idx]
+            w, h = im.size
+            if w == 0 or h == 0:
+                im = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+                w, h = im.size
+            atlas.paste(im, (x, y))
+            placements.append((x, y))
+            x += w + padding
+            row_h = max(row_h, h)
+        y += row_h + padding
+
+    return atlas, placements
+
+
+# [6] ---------- Debug printing (optional) --------------------------------------
+
+def debug_print_linear_rows(linear_bytes: bytes, w: int, h: int) -> None:
+    """
+    [6.1] Print a hex nibble dump of the top-left w×h region of linear IA4 pixels.
+          Useful to compare against expectations for a given glyph.
+    """
+    nibbles = ia4_nibbles_from_bytes(linear_bytes)
+    for row in range(h):
+        start = row * w
+        end = start + w
+        row_vals = nibbles[start:end]
+        print(f"Row {row:02d}: {''.join(f'{p:X}' for p in row_vals)}")
+
+
+# [7] ---------- Main CLI -------------------------------------------------------
+
+def main() -> None:
+    """
+    [7.1] Drive the extraction:
+         • Read C file
+         • Build one-glyph PNG (A)
+         • Build full-atlas PNG (optional)
+    """
+    font_name = "fontBankGothic"  # change if needed
+    c_file_path = f"{font_name}.c"
+
+    print(f"[INFO] Reading C source file: {c_file_path}")
+    glyphs, font_bytes = load_font_arrays_from_c(c_file_path, font_name)
+    print(f"[INFO] Parsed {len(glyphs)} glyph definitions.")
+
+    # [7.1.a] Determine base offset for relative addressing of tiled data.
+    base_offset = compute_base_offset(glyphs)
+    print(f"[INFO] Base data offset: 0x{base_offset:08X}")
+
+    # [7.1.b] Extract a single example: 'A' (ASCII 65).
+    glyph_A: Optional[Glyph] = next((g for g in glyphs if g.codepoint == 65), None)
+    if glyph_A is None:
+        print("[WARN] Glyph 'A' (65) not found — skipping single-glyph export.")
+    else:
+        print("[INFO] Generating single character 'A' PNG…")
+        g_img = extract_glyph_bitmap(glyph_A, base_offset, font_bytes)
+
+        # (Optional) low-level debug: show the nibbles before IA4 decode.
+        padded_w = math.ceil(glyph_A.width / 8) * 8
+        padded_h = math.ceil(glyph_A.height / 8) * 8
+        tiled_len = (padded_w * padded_h) // 2
+        rel = glyph_A.data_offset - base_offset
+        linear_ia4 = deswizzle_simple_tiled(font_bytes[rel:rel + tiled_len], padded_w, padded_h)
+
+        print("\n--- Raw 4-bit Linear Pixel Data for 'A' (ID 65) ---")
+        debug_print_linear_rows(linear_ia4, glyph_A.width, glyph_A.height)
+        print("---------------------------------------------------\n")
+
+        # Compose onto a tiny atlas (here just 64×64).
+        atlas = Image.new("RGBA", (max(64, g_img.width), max(64, g_img.height)), (0, 0, 0, 0))
+        atlas.paste(g_img, (0, 0))
+        out_A = f"{font_name}_A.png"
+        atlas.save(out_A)
+        print(f"[OK] Saved single glyph: {out_A}")
+
+    # [7.1.c] Build a full atlas for all non-empty glyphs.
+    print("[INFO] Building full atlas for all glyphs…")
+    non_empty = [g for g in glyphs if g.width > 0 and g.height > 0]
+    images = [extract_glyph_bitmap(g, base_offset, font_bytes) for g in non_empty]
+    atlas, placements = pack_glyphs_into_atlas(non_empty, images, max_row_width=1024, padding=1)
+    out_atlas = f"{font_name}_atlas.png"
+    atlas.save(out_atlas)
+    print(f"[OK] Saved atlas: {out_atlas}  (glyphs: {len(non_empty)})")
+
+
 if __name__ == "__main__":
     main()
